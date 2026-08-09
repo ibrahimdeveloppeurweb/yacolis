@@ -2,6 +2,21 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        maven {
+            url 'https://api.mapbox.com/downloads/v2/releases/maven'
+            authentication {
+                basic(BasicAuthentication)
+            }
+            credentials {
+                def properties = new Properties()
+                def localPropertiesFile = rootProject.file('local.properties')
+                if (localPropertiesFile.exists()) {
+                    properties.load(localPropertiesFile.newDataInputStream())
+                }
+                username = "mapbox"
+                password = properties.getProperty("MAPBOX_DOWNLOADS_TOKEN") ?: ""
+            }
+        }
     }
 }
 

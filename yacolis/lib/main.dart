@@ -17,7 +17,7 @@ class YacolisApp extends StatelessWidget {
       title: 'Yacolis',
       theme: AppTheme.lightTheme,
       debugShowCheckedModeBanner: false,
-      initialRoute: AppRoutes.home,
+      initialRoute: AppRoutes.delivery,
       onGenerateRoute: AppRoutes.generateRoute,
       localizationsDelegates: const [
         GlobalMaterialLocalizations.delegate,
