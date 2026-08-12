@@ -150,8 +150,16 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
             final mainText =
                 p['structured_formatting']?['main_text']?.toString() ??
                     description;
-            final secondaryText =
+            String secondaryText =
                 p['structured_formatting']?['secondary_text']?.toString() ?? '';
+
+            // Nettoyage : On enlève "Côte d'Ivoire" pour faire plus propre
+            secondaryText = secondaryText.replaceAll(', Côte d\'Ivoire', '');
+            secondaryText = secondaryText.replaceAll('Côte d\'Ivoire', '');
+            secondaryText = secondaryText.trim();
+            if (secondaryText.endsWith(',')) {
+              secondaryText = secondaryText.substring(0, secondaryText.length - 1);
+            }
 
             results.add({
               'text': mainText,
@@ -331,16 +339,31 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
                         ),
                         const SizedBox(width: 8),
                         // Bouton Carte
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 12, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(16),
+                        GestureDetector(
+                          onTap: () {
+                            // Valide la sélection actuelle et retourne sur la carte
+                            String pickup = _departureController.text;
+                            String dropoff = _destinationController.text;
+                            
+                            if (pickup.isEmpty) pickup = 'Position actuelle';
+                            if (dropoff.isEmpty) dropoff = 'Adresse de livraison';
+                            
+                            Navigator.pop(context, {
+                              'pickup': pickup,
+                              'dropoff': dropoff
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.grey.shade200,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: const Text('Carte',
+                                style: TextStyle(
+                                    fontSize: 13, fontWeight: FontWeight.w500)),
                           ),
-                          child: const Text('Carte',
-                              style: TextStyle(
-                                  fontSize: 13, fontWeight: FontWeight.w500)),
                         ),
                       ],
                     ),
