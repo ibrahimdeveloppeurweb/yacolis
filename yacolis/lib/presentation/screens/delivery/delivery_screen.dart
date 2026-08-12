@@ -3,6 +3,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
+import 'package:app_links/app_links.dart';
 import '../../../core/theme/app_colors.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'dart:async';
@@ -38,11 +39,76 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   bool _isReady = false;
   StreamSubscription<Position>? _positionStream;
   Timer? _splashTimer;
+  
+  // App Links pour intercepter les liens WhatsApp (geo: ou Google Maps)
+  late AppLinks _appLinks;
+  StreamSubscription<Uri>? _linkSubscription;
 
   @override
   void initState() {
     super.initState();
     _fetchRealLocation();
+    _initDeepLinks();
+  }
+
+  void _initDeepLinks() {
+    _appLinks = AppLinks();
+    
+    // Si l'application était fermée et s'ouvre via un lien WhatsApp
+    _appLinks.getInitialAppLink().then((uri) {
+      if (uri != null) _handleIncomingLink(uri);
+    });
+
+    // Si l'application est déjà ouverte en arrière-plan
+    _linkSubscription = _appLinks.uriLinkStream.listen((uri) {
+      _handleIncomingLink(uri);
+    });
+  }
+
+  void _handleIncomingLink(Uri uri) {
+    // Cas 1 : WhatsApp envoie un lien du type geo:latitude,longitude
+    if (uri.scheme == 'geo') {
+      String path = uri.path; // ex: 5.3599,-4.0083
+      if (path.contains(',')) {
+        var parts = path.split(',');
+        double lat = double.tryParse(parts[0]) ?? 0;
+        double lng = double.tryParse(parts[1]) ?? 0;
+        _setDestinationFromCoordinates(lat, lng);
+      }
+    } 
+    // Cas 2 : Lien Google Maps standard (https://maps.google.com/?q=lat,lng)
+    else {
+      String? q = uri.queryParameters['q'];
+      if (q != null && q.contains(',')) {
+        var parts = q.split(',');
+        double lat = double.tryParse(parts[0]) ?? 0;
+        double lng = double.tryParse(parts[1]) ?? 0;
+        _setDestinationFromCoordinates(lat, lng);
+      }
+    }
+  }
+
+  Future<void> _setDestinationFromCoordinates(double lat, double lng) async {
+    try {
+      List<Placemark> placemarks = await placemarkFromCoordinates(lat, lng);
+      if (placemarks.isNotEmpty) {
+        Placemark place = placemarks.first;
+        List<String> addressParts = [];
+        if (place.street != null && place.street!.isNotEmpty) addressParts.add(place.street!);
+        if (place.locality != null && place.locality!.isNotEmpty) addressParts.add(place.locality!);
+        
+        if (addressParts.isNotEmpty) {
+          setState(() {
+            dropoffAddress = addressParts.join(', ');
+          });
+        }
+      }
+    } catch (e) {
+      // Si la rue n'est pas trouvée, on affiche les coordonnées GPS
+      setState(() {
+        dropoffAddress = "Lieu pointé ($lat, $lng)";
+      });
+    }
   }
 
   void _hideSplashScreen() {
@@ -201,6 +267,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   void dispose() {
     _splashTimer?.cancel();
     _positionStream?.cancel();
+    _linkSubscription?.cancel();
     super.dispose();
   }
 
