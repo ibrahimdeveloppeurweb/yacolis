@@ -4,6 +4,7 @@ import 'package:geocoding/geocoding.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:async';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/theme/app_colors.dart';
 
 class AddressSelectionScreen extends StatefulWidget {
@@ -31,6 +32,7 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
 
   // Mapbox Autocomplete
   List<Map<String, dynamic>> _searchResults = [];
+  List<Map<String, dynamic>> _recentSearches = [];
   Timer? _debounce;
   bool _isSearching = false;
   final String _googleApiKey = 'AIzaSyAFsfPw7h8v6horSQZG-noLv5ddNndF4xc';
@@ -38,6 +40,7 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
   @override
   void initState() {
     super.initState();
+    _loadRecentSearches();
     _departureController = TextEditingController(
         text: widget.initialPickupAddress.isNotEmpty
             ? widget.initialPickupAddress
@@ -78,9 +81,48 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
     super.dispose();
   }
 
-  void _onSuggestionSelected(String text) {
+  double? _selectedPickupLat;
+  double? _selectedPickupLng;
+  double? _selectedDropoffLat;
+  double? _selectedDropoffLng;
+
+  Future<void> _onSuggestionSelected(String text, {String? placeName, String? placeId, double? passedLat, double? passedLng}) async {
+    double? lat = passedLat;
+    double? lng = passedLng;
+
+    if (placeId != null && placeId.isNotEmpty && lat == null && lng == null) {
+      // Afficher un indicateur de chargement si nécessaire
+      try {
+        final url = Uri.parse(
+            'https://maps.googleapis.com/maps/api/place/details/json?place_id=$placeId&fields=geometry&key=$_googleApiKey');
+        final response = await http.get(url);
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          if (data['status'] == 'OK') {
+            final location = data['result']['geometry']['location'];
+            lat = location['lat'];
+            lng = location['lng'];
+          }
+        }
+      } catch (e) {
+        debugPrint('Erreur lors de la récupération des détails du lieu: $e');
+      }
+    }
+
     if (_departureFocus.hasFocus) {
       _departureController.text = text;
+      _selectedPickupLat = lat;
+      _selectedPickupLng = lng;
+      if (_selectedPickupLat != null && _selectedPickupLng != null) {
+        _saveToRecentSearches({
+          'text': text,
+          'place_name': placeName ?? '',
+          'place_id': placeId,
+          'lat': _selectedPickupLat,
+          'lng': _selectedPickupLng,
+        });
+      }
+
       if (_destinationController.text.isEmpty ||
           _destinationController.text == 'Adresse de livraison') {
         _departureFocus.unfocus();
@@ -91,11 +133,28 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
       } else {
         Navigator.pop(context, {
           'pickup': _departureController.text,
-          'dropoff': _destinationController.text
+          'dropoff': _destinationController.text,
+          if (_selectedPickupLat != null && _selectedPickupLng != null) 'pickupLat': _selectedPickupLat,
+          if (_selectedPickupLat != null && _selectedPickupLng != null) 'pickupLng': _selectedPickupLng,
+          if (_selectedDropoffLat != null && _selectedDropoffLng != null) 'dropoffLat': _selectedDropoffLat,
+          if (_selectedDropoffLat != null && _selectedDropoffLng != null) 'dropoffLng': _selectedDropoffLng,
         });
       }
     } else if (_destinationFocus.hasFocus) {
       _destinationController.text = text;
+      _selectedDropoffLat = lat;
+      _selectedDropoffLng = lng;
+
+      if (_selectedDropoffLat != null && _selectedDropoffLng != null) {
+        _saveToRecentSearches({
+          'text': text,
+          'place_name': placeName ?? '',
+          'place_id': placeId,
+          'lat': _selectedDropoffLat,
+          'lng': _selectedDropoffLng,
+        });
+      }
+
       if (_departureController.text.isEmpty ||
           _departureController.text == 'Position actuelle') {
         _destinationFocus.unfocus();
@@ -106,15 +165,67 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
       } else {
         Navigator.pop(context, {
           'pickup': _departureController.text,
-          'dropoff': _destinationController.text
+          'dropoff': _destinationController.text,
+          if (_selectedPickupLat != null && _selectedPickupLng != null) 'pickupLat': _selectedPickupLat,
+          if (_selectedPickupLat != null && _selectedPickupLng != null) 'pickupLng': _selectedPickupLng,
+          if (_selectedDropoffLat != null && _selectedDropoffLat != null) 'dropoffLat': _selectedDropoffLat,
+          if (_selectedDropoffLng != null && _selectedDropoffLng != null) 'dropoffLng': _selectedDropoffLng,
         });
       }
     } else {
       Navigator.pop(context, {
         'pickup': _departureController.text,
-        'dropoff': _destinationController.text
+        'dropoff': _destinationController.text,
+        if (_selectedPickupLat != null) 'pickupLat': _selectedPickupLat,
+        if (_selectedPickupLng != null) 'pickupLng': _selectedPickupLng,
+        if (_selectedDropoffLat != null) 'dropoffLat': _selectedDropoffLat,
+        if (_selectedDropoffLng != null) 'dropoffLng': _selectedDropoffLng,
       });
     }
+  }
+
+  Future<void> _loadRecentSearches() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? recentJson = prefs.getString('recent_searches');
+    if (recentJson != null) {
+      try {
+        final List<dynamic> decoded = json.decode(recentJson);
+        setState(() {
+          _recentSearches = decoded.map((e) => Map<String, dynamic>.from(e)).toList();
+        });
+      } catch (e) {
+        debugPrint('Erreur chargement historiques: $e');
+      }
+    }
+  }
+
+  Future<void> _saveToRecentSearches(Map<String, dynamic> place) async {
+    final prefs = await SharedPreferences.getInstance();
+    
+    // Retirer le lieu s'il existe déjà pour le remettre en haut
+    _recentSearches.removeWhere((p) => p['text'] == place['text'] || (p['place_id'] != null && p['place_id'] == place['place_id']));
+    
+    // Ajouter au début
+    _recentSearches.insert(0, place);
+    
+    // Limiter à 6 éléments
+    if (_recentSearches.length > 6) {
+      _recentSearches = _recentSearches.sublist(0, 6);
+    }
+    
+    await prefs.setString('recent_searches', json.encode(_recentSearches));
+    if (mounted) setState(() {});
+  }
+
+  IconData _getIconForPlace(String name) {
+    name = name.toLowerCase();
+    if (name.contains('pharmacie') || name.contains('hopital') || name.contains('clinique') || name.contains('santé')) {
+      return Icons.medical_services; // Ressemble à la trousse médicale de la capture
+    }
+    if (name.contains('restaurant') || name.contains('fast food') || name.contains('maquis')) {
+      return Icons.restaurant;
+    }
+    return Icons.location_on; // Marqueur par défaut pour les lieux classiques
   }
 
   void _onSearchChanged(String query) {
@@ -164,12 +275,21 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
             results.add({
               'text': mainText,
               'place_name': secondaryText,
+              'place_id': p['place_id'],
               'center': [0.0, 0.0],
             });
           }
 
           setState(() {
-            _searchResults = results;
+            String currentText = _departureFocus.hasFocus 
+                ? _departureController.text 
+                : _destinationController.text;
+                
+            if (query == currentText) {
+              _searchResults = results;
+            } else if (currentText.isEmpty) {
+              _searchResults = [];
+            }
             _isSearching = false;
           });
         } else {
@@ -248,7 +368,7 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
       }
 
       if (mounted) {
-        _onSuggestionSelected(locationName);
+        _onSuggestionSelected(locationName, placeName: 'Position GPS', passedLat: position.latitude, passedLng: position.longitude);
       }
     } catch (e) {
       if (mounted) {
@@ -413,6 +533,46 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
                             ],
                           ),
                         ),
+                        // Bouton X
+                        IconButton(
+                          onPressed: () => _destinationController.clear(),
+                          icon: const Icon(Icons.close,
+                              color: Colors.black54, size: 20),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                        ),
+                        const SizedBox(width: 8),
+                        // Bouton Carte
+                        GestureDetector(
+                          onTap: () {
+                            // Valide la sélection actuelle et retourne sur la carte
+                            String pickup = _departureController.text;
+                            String dropoff = _destinationController.text;
+                            
+                            if (pickup.isEmpty) pickup = 'Position actuelle';
+                            if (dropoff.isEmpty) dropoff = 'Adresse de livraison';
+                            
+                            Navigator.pop(context, {
+                              'pickup': pickup,
+                              'dropoff': dropoff,
+                              if (_selectedPickupLat != null) 'pickupLat': _selectedPickupLat,
+                              if (_selectedPickupLng != null) 'pickupLng': _selectedPickupLng,
+                              if (_selectedDropoffLat != null) 'dropoffLat': _selectedDropoffLat,
+                              if (_selectedDropoffLng != null) 'dropoffLng': _selectedDropoffLng,
+                            });
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.grey.shade200,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: const Text('Arrêts',
+                                style: TextStyle(
+                                    fontSize: 13, fontWeight: FontWeight.w500)),
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -422,57 +582,69 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
 
             // Liste des suggestions
             Expanded(
-              child: _searchResults.isEmpty &&
-                      _destinationController.text.isEmpty &&
-                      !_isSearching
-                  ? ListView(
+              child: _isSearching
+                  ? const Center(child: CircularProgressIndicator())
+                  : ListView(
                       padding: const EdgeInsets.only(top: 16),
                       children: [
-                        // Votre position
-                        ListTile(
-                          leading: const Icon(Icons.navigation,
-                              color: Colors.black87),
-                          title: const Text('Votre position',
-                              style: TextStyle(
-                                  fontWeight: FontWeight.w600, fontSize: 15)),
-                          subtitle: const Text(
-                              'Prise en charge à l\'emplacement indiqué par les données GPS',
-                              style:
-                                  TextStyle(fontSize: 12, color: Colors.grey)),
-                          trailing: _isLoadingLocation
-                              ? const SizedBox(
-                                  width: 20,
-                                  height: 20,
-                                  child:
-                                      CircularProgressIndicator(strokeWidth: 2))
-                              : null,
-                          onTap: _isLoadingLocation
-                              ? null
-                              : () {
-                                  _getCurrentLocation();
-                                },
-                        ),
-
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          child: Divider(color: Colors.grey.shade300),
-                        ),
+                        if (_searchResults.isEmpty) ...[
+                          // Votre position
+                          ListTile(
+                            leading: const Icon(Icons.navigation,
+                                color: Colors.black87),
+                            title: const Text('Votre position',
+                                style: TextStyle(
+                                    fontWeight: FontWeight.w600, fontSize: 15)),
+                            subtitle: const Text(
+                                'Prise en charge à l\'emplacement indiqué par les données GPS',
+                                style:
+                                    TextStyle(fontSize: 12, color: Colors.grey)),
+                            trailing: _isLoadingLocation
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child:
+                                        CircularProgressIndicator(strokeWidth: 2))
+                                : null,
+                            onTap: _isLoadingLocation
+                                ? null
+                                : () {
+                                    _getCurrentLocation();
+                                  },
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            child: Divider(color: Colors.grey.shade300),
+                          ),
+                          ..._recentSearches.map((item) => _buildSuggestionItem(
+                              item['text'] ?? '',
+                              item['place_name'] ?? '',
+                              '',
+                              () => _onSuggestionSelected(item['text'] ?? '', placeName: item['place_name'] ?? '', placeId: item['place_id']),
+                              icon: _getIconForPlace(item['text'] ?? '')
+                          )).toList(),
+                        ] else ...[
+                          // Si recherche en cours, afficher les récents qui correspondent en premier
+                          ..._recentSearches
+                              .where((item) => (item['text'] ?? '').toLowerCase().contains(
+                                  (_departureFocus.hasFocus ? _departureController.text : _destinationController.text).toLowerCase()))
+                              .map((item) => _buildSuggestionItem(
+                                  item['text'] ?? '',
+                                  item['place_name'] ?? '',
+                                  '',
+                                  () => _onSuggestionSelected(item['text'] ?? '', placeName: item['place_name'] ?? '', placeId: item['place_id']),
+                                  icon: _getIconForPlace(item['text'] ?? '')))
+                              .toList(),
+                          ..._searchResults.map((item) => _buildSuggestionItem(
+                              item['text'] ?? '',
+                              item['place_name'] ?? '',
+                              '',
+                              () => _onSuggestionSelected(item['text'] ?? '', placeName: item['place_name'] ?? '', placeId: item['place_id']),
+                              icon: Icons.location_on
+                          )).toList(),
+                        ],
                       ],
-                    )
-                  : _isSearching
-                      ? const Center(child: CircularProgressIndicator())
-                      : ListView.builder(
-                          padding: const EdgeInsets.only(top: 16),
-                          itemCount: _searchResults.length,
-                          itemBuilder: (context, index) {
-                            final item = _searchResults[index];
-                            return _buildSuggestionItem(
-                                item['text'],
-                                item['place_name'],
-                                '', // Distance non disponible immédiatement via cette API sans calcul
-                                () => _onSuggestionSelected(item['text']));
-                          },
-                        ),
+                    ),
             ),
           ],
         ),
@@ -481,11 +653,11 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
   }
 
   Widget _buildSuggestionItem(
-      String title, String subtitle, String distance, VoidCallback onTap) {
+      String title, String subtitle, String distance, VoidCallback onTap, {IconData icon = Icons.location_on}) {
     return Column(
       children: [
         ListTile(
-          leading: Icon(Icons.location_on, color: Colors.grey.shade400),
+          leading: Icon(icon, color: Colors.grey.shade400),
           title: Text(
             title,
             style: const TextStyle(

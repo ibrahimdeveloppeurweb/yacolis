@@ -1,11 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:app_links/app_links.dart';
 import '../../../core/theme/app_colors.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
 import 'address_selection_screen.dart';
 
@@ -16,12 +19,26 @@ class DeliveryScreen extends StatefulWidget {
   State<DeliveryScreen> createState() => _DeliveryScreenState();
 }
 
-class _DeliveryScreenState extends State<DeliveryScreen> {
+class _DeliveryScreenState extends State<DeliveryScreen> with TickerProviderStateMixin {
   // Variables d'état pour les adresses
   String pickupAddress = 'Recherche en cours...';
   String dropoffAddress = 'Adresse de livraison';
+  bool _isReady = false;
+  Timer? _splashTimer;
+  Timer? _trafficRefreshTimer;
 
-  // Coordonnées de la position du client (Par défaut Abidjan)
+  // Variables pour le trajet
+  LatLng? _destinationLocation;
+  LatLng? _customPickupLocation;
+  List<LatLng> _routePoints = [];
+  List<LatLng> _oldRoutePoints = [];
+  List<LatLng> _displayedRoutePoints = [];
+  bool _isErasing = false;
+  AnimationController? _routeAnimationController;
+  
+  String _estimatedTime = '';
+  String _arrivalTime = '';
+  String _driverWaitTime = ''; // Temps d'approche du livreur calculé dynamiquement
   LatLng _currentLocation = const LatLng(5.359951, -4.008256);
 
   // Centre de la vue de la carte (décalé pour ajuster le marqueur au-dessus du panneau)
@@ -35,10 +52,7 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   final String _mapboxToken =
       'pk.eyJ1IjoiY2lzc2VpYnJhaGltMTk5NSIsImEiOiJjbXNncTJ3eHgwbWV3MnZzMXdnbzNxYjQyIn0.hKyv-YChwmlIwfZNUmiS2A';
 
-  // État de chargement initial (Splash Screen)
-  bool _isReady = false;
   StreamSubscription<Position>? _positionStream;
-  Timer? _splashTimer;
   
   // App Links pour intercepter les liens WhatsApp (geo: ou Google Maps)
   late AppLinks _appLinks;
@@ -47,8 +61,45 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   @override
   void initState() {
     super.initState();
+    
+    // Initialisation du contrôleur d'animation pour le trajet
+    _routeAnimationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000), // Durée de croissance/effacement
+    )..addListener(() {
+        if (mounted) {
+          setState(() {
+            final progress = _routeAnimationController!.value;
+            if (_isErasing) {
+              // Effacement de la destination vers la source (on garde les premiers points, donc ça rétrécit)
+              int pointsCount = (_oldRoutePoints.length * progress).round();
+              if (pointsCount == 0) {
+                _displayedRoutePoints = [];
+              } else {
+                _displayedRoutePoints = _oldRoutePoints.sublist(0, pointsCount);
+              }
+            } else {
+              // Croissance de la source vers la destination
+              int pointsCount = (_routePoints.length * progress).round();
+              if (pointsCount == 0) {
+                _displayedRoutePoints = [];
+              } else {
+                _displayedRoutePoints = _routePoints.sublist(0, pointsCount);
+              }
+            }
+          });
+        }
+      });
+      
     _fetchRealLocation();
     _initDeepLinks();
+    
+    // Démarre l'actualisation automatique du trafic (toutes les 2 minutes)
+    _trafficRefreshTimer = Timer.periodic(const Duration(minutes: 2), (_) {
+      if (dropoffAddress != 'Adresse de livraison' && _destinationLocation != null) {
+        _calculateRoute();
+      }
+    });
   }
 
   void _initDeepLinks() {
@@ -101,12 +152,264 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
           setState(() {
             dropoffAddress = addressParts.join(', ');
           });
+          _calculateRoute();
         }
       }
     } catch (e) {
       // Si la rue n'est pas trouvée, on affiche les coordonnées GPS
       setState(() {
         dropoffAddress = "Lieu pointé ($lat, $lng)";
+      });
+    }
+  }
+
+  Future<void> _calculateRoute() async {
+    if (dropoffAddress == 'Adresse de livraison' || dropoffAddress.isEmpty) return;
+
+    if (mounted) {
+      setState(() {
+        _estimatedTime = ''; // Reset pour afficher "Calcul en cours..."
+        _arrivalTime = '';
+        _driverWaitTime = '';
+      });
+    }
+
+    try {
+      LatLng? dest = _destinationLocation;
+      LatLng? start = _customPickupLocation;
+      
+      // Si prise en charge modifiée mais pas de coordonnées exactes (ex: via deep link ou saisie manuelle sans selection)
+      if (start == null && pickupAddress != 'Position actuelle' && pickupAddress != 'Recherche en cours...') {
+        try {
+          final geocodeUrl = Uri.parse('https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(pickupAddress)}.json?access_token=$_mapboxToken&country=CI&limit=1');
+          final geoResponse = await http.get(geocodeUrl);
+          if (geoResponse.statusCode == 200) {
+            final geoData = json.decode(geoResponse.body);
+            if (geoData['features'] != null && geoData['features'].isNotEmpty) {
+              final coords = geoData['features'][0]['center'];
+              start = LatLng(coords[1], coords[0]);
+            }
+          }
+        } catch (e) {
+          debugPrint('Mapbox geocoding error for pickup: $e');
+        }
+      }
+      
+      start ??= _currentLocation; // Fallback sur la position GPS réelle
+      
+      // Essai 1 : Mapbox Geocoding pour la destination (plus fiable pour la Côte d'Ivoire souvent)
+      if (dest == null) {
+        try {
+          final geocodeUrl = Uri.parse('https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(dropoffAddress)}.json?access_token=$_mapboxToken&country=CI&limit=1');
+          final geoResponse = await http.get(geocodeUrl);
+          if (geoResponse.statusCode == 200) {
+            final geoData = json.decode(geoResponse.body);
+            if (geoData['features'] != null && geoData['features'].isNotEmpty) {
+              final coords = geoData['features'][0]['center'];
+              dest = LatLng(coords[1], coords[0]);
+            }
+          }
+        } catch (e) {
+          debugPrint('Mapbox geocoding error: $e');
+        }
+      }
+
+      // Essai 2 : geocoding package (natif) si Mapbox échoue
+      if (dest == null) {
+        try {
+          List<Location> locations = await locationFromAddress(dropoffAddress);
+          if (locations.isNotEmpty) {
+            dest = LatLng(locations.first.latitude, locations.first.longitude);
+          }
+        } catch (e) {
+          debugPrint('Native geocoding error: $e');
+        }
+      }
+
+      if (dest != null) {
+        if (mounted) {
+          setState(() {
+            _destinationLocation = dest;
+            _customPickupLocation = start; // Met en cache si geocodé
+          });
+        }
+
+        // Utilisation de l'API Mapbox Directions avec le profil "driving-traffic" pour obtenir 
+        // l'itinéraire en tenant compte des bouchons et du trafic en temps réel.
+        final url = Uri.parse(
+            'https://api.mapbox.com/directions/v5/mapbox/driving-traffic/'
+            '${start.longitude},${start.latitude};'
+            '${dest.longitude},${dest.latitude}'
+            '?overview=full&geometries=geojson&access_token=$_mapboxToken');
+
+        final response = await http.get(url);
+        if (response.statusCode == 200) {
+          final data = json.decode(response.body);
+          if (data['code'] == 'Ok' && data['routes'] != null && data['routes'].isNotEmpty) {
+            final route = data['routes'][0];
+            final geometry = route['geometry'];
+            final durationSeconds = route['duration'];
+
+            List<LatLng> points = [];
+            for (var coord in geometry['coordinates']) {
+              points.add(LatLng(coord[1], coord[0])); // [lon, lat] -> LatLng(lat, lon)
+            }
+            if (points.isNotEmpty) {
+              // 1. Isoler la partie de la route qui concerne notre trajet
+              int closestStartIdx = 0;
+              double minStartDist = double.infinity;
+              for (int i = 0; i < points.length; i++) {
+                double dist = const Distance().distance(points[i], start);
+                if (dist < minStartDist) {
+                  minStartDist = dist;
+                  closestStartIdx = i;
+                }
+              }
+
+              int closestDestIdx = 0;
+              double minDestDist = double.infinity;
+              for (int i = 0; i < points.length; i++) {
+                double dist = const Distance().distance(points[i], dest!);
+                if (dist < minDestDist) {
+                  minDestDist = dist;
+                  closestDestIdx = i;
+                }
+              }
+
+              if (closestStartIdx <= closestDestIdx) {
+                points = points.sublist(closestStartIdx, closestDestIdx + 1);
+              } else {
+                points = [];
+              }
+
+              // 2. Supprimer agressivement tout débordement (overshoot) aux extrémités
+              if (points.isNotEmpty) {
+                double totalDist = const Distance().distance(start, dest!);
+                
+                // Nettoyer la fin (si la route continue après l'arrivée)
+                while (points.isNotEmpty) {
+                  double distFromStart = const Distance().distance(start, points.last);
+                  // Si le point est plus loin du départ que ne l'est la destination, on le supprime (avec une marge de tolérance de 20m pour les courbes)
+                  if (distFromStart > totalDist + 20) {
+                    points.removeLast();
+                  } else {
+                    break;
+                  }
+                }
+                
+                // Nettoyer le début (si la route a commencé trop loin en arrière)
+                while (points.isNotEmpty) {
+                  double distFromDest = const Distance().distance(dest!, points.first);
+                  if (distFromDest > totalDist + 20) {
+                    points.removeAt(0);
+                  } else {
+                    break;
+                  }
+                }
+              }
+
+              // 3. Forcer la connexion exacte au centre des marqueurs
+              points.insert(0, start);
+              points.add(dest!);
+            }
+
+            if (mounted) {
+              // S'il y a déjà un trajet d'affiché, on lance l'animation d'effacement
+              if (_displayedRoutePoints.isNotEmpty) {
+                setState(() {
+                  _oldRoutePoints = List.from(_displayedRoutePoints);
+                  _routePoints = points;
+                  _isErasing = true;
+                });
+                
+                // On efface, puis on dessine
+                _routeAnimationController?.reverse(from: 1.0).then((_) {
+                  if (mounted) {
+                    setState(() {
+                      _isErasing = false;
+                    });
+                    _routeAnimationController?.forward(from: 0.0);
+                  }
+                });
+              } else {
+                // S'il n'y a pas d'ancien trajet, on dessine directement le nouveau
+                setState(() {
+                  _routePoints = points;
+                  _isErasing = false;
+                });
+                _routeAnimationController?.forward(from: 0.0);
+              }
+              
+              setState(() {
+                int tripMinutes = (durationSeconds / 60).round();
+                _estimatedTime = tripMinutes.toString();
+                
+                // Calcul dynamique du temps d'approche du livreur pour ne pas être statique
+                // On prend environ un tiers/moitié du temps de trajet, entre 3 et 12 minutes
+                int waitTime = (tripMinutes / 2.5).round().clamp(3, 12).toInt();
+                
+                // On garantit absolument que le temps de la carte soit inférieur au temps de destination
+                if (waitTime >= tripMinutes) {
+                  waitTime = (tripMinutes / 2).floor();
+                  if (waitTime < 1) waitTime = 1;
+                }
+                
+                _driverWaitTime = waitTime.toString();
+                
+                DateTime arrival = DateTime.now().add(Duration(minutes: tripMinutes + waitTime));
+                String hour = arrival.hour.toString().padLeft(2, '0');
+                String minute = arrival.minute.toString().padLeft(2, '0');
+                _arrivalTime = '$hour:$minute';
+              });
+              
+              // Cadrer la carte sur l'ensemble du trajet pour le rendre visible, tout en évitant le panneau inférieur
+              try {
+                final bounds = LatLngBounds.fromPoints(points);
+                _mapController.fitCamera(CameraFit.bounds(
+                  bounds: bounds,
+                  padding: EdgeInsets.only(
+                    top: 160.0,
+                    left: 80.0,
+                    right: 80.0,
+                    bottom: MediaQuery.of(context).size.height * 0.55, // Garde une marge importante au-dessus du panneau
+                  ),
+                ));
+              } catch (_) {}
+            }
+          } else {
+             if (mounted) setState(() { 
+              _estimatedTime = "N/A";
+              _arrivalTime = "";
+            });
+          }
+        } else {
+           if (mounted) {
+             String errMsg = "Err ${response.statusCode}";
+             try {
+               final errBody = json.decode(response.body);
+               if (errBody['code'] == 'NoRoute') {
+                 errMsg = "Impossible";
+               }
+             } catch (_) {}
+             
+             setState(() { 
+              _estimatedTime = errMsg;
+              _arrivalTime = "";
+            });
+             debugPrint('Routing API Error: ${response.statusCode} - ${response.body}');
+           }
+        }
+      } else {
+         if (mounted) setState(() { 
+          _estimatedTime = "Introuvable";
+          _arrivalTime = "";
+        });
+      }
+    } catch (e) {
+      debugPrint('Erreur lors du calcul du trajet : $e');
+      if (mounted) setState(() { 
+        _estimatedTime = "Erreur";
+        _arrivalTime = "";
       });
     }
   }
@@ -122,20 +425,30 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
   }
 
   Future<void> _updateAddress(double lat, double lon) async {
+    if (_customPickupLocation != null) return; // Ne pas écraser l'adresse si l'utilisateur a choisi un point précis
+
     try {
       var placemarks = await placemarkFromCoordinates(lat, lon);
       if (placemarks.isNotEmpty) {
         var place = placemarks.first;
         if (mounted) {
+          String addressName = place.street?.isNotEmpty == true
+              ? place.street!
+              : 'Position Inconnue';
+          if (addressName.contains(',')) {
+            addressName = addressName.split(',').first.trim();
+          }
+          if ((addressName.contains('+') && addressName.length <= 15) || 
+              addressName.toLowerCase().contains('unnamed')) {
+            addressName = 'Position actuelle';
+          }
           setState(() {
-            String addressName = place.street?.isNotEmpty == true
-                ? place.street!
-                : 'Position Inconnue';
-            if (addressName.contains(',')) {
-              addressName = addressName.split(',').first.trim();
-            }
             pickupAddress = addressName;
           });
+          
+          if (addressName != 'Position actuelle' && addressName != 'Position Inconnue' && addressName != 'Recherche en cours...') {
+            _saveToRecentSearchesFromGPS(addressName, place.locality ?? 'Abidjan', lat, lon);
+          }
         }
       }
     } catch (e) {
@@ -145,6 +458,32 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
         });
       }
     }
+  }
+
+  Future<void> _saveToRecentSearchesFromGPS(String text, String placeName, double lat, double lng) async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? recentJson = prefs.getString('recent_searches');
+    List<Map<String, dynamic>> recentSearches = [];
+    if (recentJson != null) {
+      try {
+        final List<dynamic> decoded = json.decode(recentJson);
+        recentSearches = decoded.map((e) => Map<String, dynamic>.from(e)).toList();
+      } catch (e) {}
+    }
+
+    recentSearches.removeWhere((p) => p['text'] == text);
+    recentSearches.insert(0, {
+      'text': text,
+      'place_name': placeName,
+      'lat': lat,
+      'lng': lng,
+    });
+
+    if (recentSearches.length > 6) {
+      recentSearches = recentSearches.sublist(0, 6);
+    }
+
+    await prefs.setString('recent_searches', json.encode(recentSearches));
   }
 
   Future<void> _fetchRealLocation() async {
@@ -183,20 +522,22 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
       // 1. Charger immédiatement la dernière position connue pour une fluidité instantanée
       var lastPosition = await Geolocator.getLastKnownPosition();
       if (lastPosition != null && mounted) {
+        double actualLat = lastPosition.latitude;
+        double actualLon = lastPosition.longitude;
+        
         setState(() {
-          _currentLocation =
-              LatLng(lastPosition.latitude, lastPosition.longitude);
+          _currentLocation = LatLng(actualLat, actualLon);
         });
 
         // Délai pour s'assurer que le MapController est prêt
         Future.delayed(const Duration(milliseconds: 100), () {
-          if (mounted) _mapController.move(_cameraCenter, 17.5);
+          if (mounted && _routePoints.isEmpty) _mapController.move(_cameraCenter, 17.5);
         });
 
         _hideSplashScreen(); // Démarre le décompte pour cacher l'écran
 
         // Mettre à jour l'adresse immédiatement sans attendre le GPS précis
-        _updateAddress(lastPosition.latitude, lastPosition.longitude);
+        _updateAddress(actualLat, actualLon);
       }
 
       // 2. Affiner avec la position GPS exacte en arrière-plan
@@ -216,16 +557,20 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
                     position.latitude,
                     position.longitude) >
                 20) {
+          double actualLat = position.latitude;
+          double actualLon = position.longitude;
+          
           setState(() {
-            _currentLocation = LatLng(position.latitude, position.longitude);
+            _currentLocation = LatLng(actualLat, actualLon);
           });
 
           Future.delayed(const Duration(milliseconds: 100), () {
-            if (mounted) _mapController.move(_cameraCenter, 17.5);
+            if (mounted && _routePoints.isEmpty) _mapController.move(_cameraCenter, 17.5);
           });
 
           _hideSplashScreen(); // Démarre le décompte si ce n'était pas fait
-          _updateAddress(position.latitude, position.longitude);
+          
+          _updateAddress(actualLat, actualLon);
         }
       }
 
@@ -237,19 +582,24 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
         ),
       ).listen((Position newPosition) {
         if (mounted) {
+          // Si on est sur l'émulateur en Californie (USA), on force Abidjan pour les tests
+          double actualLat = newPosition.latitude;
+          double actualLon = newPosition.longitude;
+          
           setState(() {
-            _currentLocation =
-                LatLng(newPosition.latitude, newPosition.longitude);
+            _currentLocation = LatLng(actualLat, actualLon);
           });
           
-          // La carte suit automatiquement le déplacement de l'utilisateur !
+          // La carte suit automatiquement le déplacement de l'utilisateur si aucun trajet n'est affiché
           try {
-            _mapController.move(_cameraCenter, _mapController.camera.zoom);
+            if (_routePoints.isEmpty) {
+              _mapController.move(_cameraCenter, _mapController.camera.zoom);
+            }
           } catch (_) {
             // Sécurité au cas où la carte ne serait pas encore totalement affichée
           }
 
-          _updateAddress(newPosition.latitude, newPosition.longitude);
+          _updateAddress(actualLat, actualLon);
         }
       });
     } catch (e) {
@@ -265,7 +615,9 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
 
   @override
   void dispose() {
+    _routeAnimationController?.dispose();
     _splashTimer?.cancel();
+    _trafficRefreshTimer?.cancel();
     _positionStream?.cancel();
     _linkSubscription?.cancel();
     super.dispose();
@@ -314,57 +666,106 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
                       'pk.eyJ1IjoiY2lzc2VpYnJhaGltMTk5NSIsImEiOiJjbXNncTJ3eHgwbWV3MnZzMXdnbzNxYjQyIn0.hKyv-YChwmlIwfZNUmiS2A',
                 },
               ),
+              PolylineLayer(
+                polylines: [
+                  if (_displayedRoutePoints.isNotEmpty)
+                    Polyline(
+                      points: _displayedRoutePoints,
+                      color: const Color(0xFF00C853), // Vert Yango
+                      strokeWidth: 5.0,
+                      strokeCap: StrokeCap.butt,
+                      strokeJoin: StrokeJoin.round,
+                    ),
+                ],
+              ),
               MarkerLayer(
                 markers: [
+                  if (_destinationLocation != null)
+                    Marker(
+                      point: _destinationLocation!,
+                      width: 24,
+                      height: 24,
+                      alignment: Alignment.center,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.black54, width: 6),
+                        ),
+                      ),
+                    ),
                   Marker(
-                    point: _currentLocation,
+                    point: _customPickupLocation ?? _currentLocation,
                     width: 90,
                     height: 90,
                     child: Stack(
                       alignment: Alignment.center,
+                      clipBehavior: Clip.none,
                       children: [
-                        // Grand halo transparent
-                        Container(
-                          width: 80,
-                          height: 80,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFE94335).withOpacity(0.12),
-                            shape: BoxShape.circle,
+                        // Grand halo transparent (uniquement si pas de trajet)
+                        if (_routePoints.isEmpty)
+                          Container(
+                            width: 80,
+                            height: 80,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE94335).withOpacity(0.12),
+                              shape: BoxShape.circle,
+                            ),
                           ),
-                        ),
                         // Cercle rouge Yango
                         Container(
-                          width: 24,
-                          height: 24,
+                          width: _routePoints.isEmpty ? 24 : 18,
+                          height: _routePoints.isEmpty ? 24 : 18,
                           decoration: BoxDecoration(
                             color: const Color(0xFFF94B2E),
                             shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white, width: 2),
+                            border: Border.all(color: Colors.white, width: _routePoints.isEmpty ? 2 : 4),
                             boxShadow: const [
                               BoxShadow(color: Colors.black26, blurRadius: 4)
                             ],
                           ),
                         ),
-                        // Flèche blanche
-                        Transform.translate(
-                          offset: const Offset(3, -3),
-                          child: Transform.rotate(
-                            angle: -0.785398, // -45 degrés
-                            child: Container(
-                              width: 8,
-                              height: 8,
-                              decoration: const BoxDecoration(
-                                color: Colors.white,
-                                borderRadius: BorderRadius.only(
-                                  topLeft: Radius.circular(1),
-                                  bottomLeft: Radius.circular(1),
-                                  bottomRight: Radius.circular(1),
-                                  topRight: Radius.circular(4), // Pointe
+                        // Flèche blanche (uniquement si pas de trajet)
+                        if (_routePoints.isEmpty)
+                          Transform.translate(
+                            offset: const Offset(3, -3),
+                            child: Transform.rotate(
+                              angle: -0.785398, // -45 degrés
+                              child: Container(
+                                width: 8,
+                                height: 8,
+                                decoration: const BoxDecoration(
+                                  color: Colors.white,
+                                  borderRadius: BorderRadius.only(
+                                    topLeft: Radius.circular(1),
+                                    bottomLeft: Radius.circular(1),
+                                    bottomRight: Radius.circular(1),
+                                    topRight: Radius.circular(4), // Pointe
+                                  ),
                                 ),
                               ),
                             ),
                           ),
-                        ),
+                        // Bulle de temps estimé
+                        if (_driverWaitTime.isNotEmpty)
+                          Positioned(
+                            top: _routePoints.isEmpty ? 0 : 5, // Ajusté pour qu'il soit bien collé
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFF94B2E),
+                                borderRadius: BorderRadius.circular(16),
+                                boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(_driverWaitTime, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold, height: 1.1)),
+                                  const Text('min', style: TextStyle(color: Colors.white, fontSize: 10, height: 1.1)),
+                                ],
+                              ),
+                            ),
+                          ),
                       ],
                     ),
                   ),
@@ -438,7 +839,8 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
             ),
           ),
 
-          // Bouton Retour
+          // Bouton Retour temporairement masqué
+          /*
           Positioned(
             bottom: MediaQuery.of(context).size.height * 0.51 + 8,
             left: 16,
@@ -455,10 +857,14 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
               ),
               child: IconButton(
                 icon: const Icon(Icons.arrow_back, color: Colors.black),
-                onPressed: () => Navigator.of(context).pop(),
+                onPressed: () {
+                  // Action de retour temporairement commentée
+                  // Navigator.of(context).pop();
+                },
               ),
             ),
           ),
+          */
 
           // Bouton Navigation
           Positioned(
@@ -478,8 +884,25 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
               child: IconButton(
                 icon: const Icon(Icons.near_me, color: Colors.black),
                 onPressed: () {
-                  // Recentrer la carte sur la position visible
-                  _mapController.move(_cameraCenter, 17.5);
+                  // Petite animation de "bump" (secousse) pour donner un retour visuel
+                  final currentCenter = _mapController.camera.center;
+                  final currentZoom = _mapController.camera.zoom;
+                  
+                  // 1. Déplacement très léger vers le haut instantanément
+                  _mapController.move(
+                    LatLng(currentCenter.latitude + 0.0003, currentCenter.longitude), 
+                    currentZoom
+                  );
+                  
+                  // 2. Retour rapide à la position de base exacte après 100 millisecondes
+                  Future.delayed(const Duration(milliseconds: 100), () {
+                    _mapController.move(currentCenter, currentZoom);
+                    
+                    // Mettre à jour l'itinéraire et le trafic en temps réel
+                    if (dropoffAddress != 'Adresse de livraison') {
+                      _calculateRoute();
+                    }
+                  });
                 },
               ),
             ),
@@ -595,7 +1018,16 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
                                             pickupAddress = shortPickup;
                                           if (shortDropoff.isNotEmpty)
                                             dropoffAddress = shortDropoff;
+                                            
+                                          // Si les coordonnées exactes sont retournées
+                                          if (result['dropoffLat'] != null && result['dropoffLng'] != null) {
+                                            _destinationLocation = LatLng(result['dropoffLat'], result['dropoffLng']);
+                                          }
+                                          if (result['pickupLat'] != null && result['pickupLng'] != null) {
+                                            _customPickupLocation = LatLng(result['pickupLat'], result['pickupLng']);
+                                          }
                                         });
+                                        _calculateRoute();
                                       }
                                     },
                                     behavior: HitTestBehavior.opaque,
@@ -688,7 +1120,16 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
                                             pickupAddress = shortPickup;
                                           if (shortDropoff.isNotEmpty)
                                             dropoffAddress = shortDropoff;
+                                            
+                                          // Si les coordonnées exactes sont retournées
+                                          if (result['dropoffLat'] != null && result['dropoffLng'] != null) {
+                                            _destinationLocation = LatLng(result['dropoffLat'], result['dropoffLng']);
+                                          }
+                                          if (result['pickupLat'] != null && result['pickupLng'] != null) {
+                                            _customPickupLocation = LatLng(result['pickupLat'], result['pickupLng']);
+                                          }
                                         });
+                                        _calculateRoute();
                                       }
                                     },
                                     behavior: HitTestBehavior.opaque,
@@ -709,9 +1150,11 @@ class _DeliveryScreenState extends State<DeliveryScreen> {
                                             children: [
                                               if (dropoffAddress !=
                                                   'Adresse de livraison')
-                                                const Text(
-                                                    '≈55 min. · arrivée estimée',
-                                                    style: TextStyle(
+                                                Text(
+                                                    _estimatedTime.isNotEmpty
+                                                        ? '≈$_estimatedTime min. · arrivée à $_arrivalTime'
+                                                        : 'Calcul en cours...',
+                                                    style: const TextStyle(
                                                         color: Colors.grey,
                                                         fontSize: 12)),
                                               Text(
