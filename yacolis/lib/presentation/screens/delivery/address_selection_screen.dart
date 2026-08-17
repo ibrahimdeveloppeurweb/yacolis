@@ -131,6 +131,15 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
           _searchResults = [];
         });
       } else {
+        if (_departureController.text == _destinationController.text) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Le point de départ et la destination doivent être différents.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return; // Ne pas valider
+        }
         Navigator.pop(context, {
           'pickup': _departureController.text,
           'dropoff': _destinationController.text,
@@ -163,6 +172,15 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
           _searchResults = [];
         });
       } else {
+        if (_departureController.text == _destinationController.text) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Le point de départ et la destination doivent être différents.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return; // Ne pas valider
+        }
         Navigator.pop(context, {
           'pickup': _departureController.text,
           'dropoff': _destinationController.text,
@@ -173,6 +191,15 @@ class _AddressSelectionScreenState extends State<AddressSelectionScreen> {
         });
       }
     } else {
+      if (_departureController.text == _destinationController.text) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Le point de départ et la destination doivent être différents.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return; // Ne pas valider
+      }
       Navigator.pop(context, {
         'pickup': _departureController.text,
         'dropoff': _destinationController.text,

@@ -43,7 +43,6 @@ class _DeliveryScreenState extends State<DeliveryScreen>
   List<LatLng> _displayedRoutePoints = [];
   bool _isErasing = false;
   AnimationController? _routeAnimationController;
-  int _lastRouteCalcId = 0;
 
   String _estimatedTime = '';
   String _arrivalTime = '';
@@ -365,12 +364,7 @@ class _DeliveryScreenState extends State<DeliveryScreen>
             }
 
             if (mounted) {
-              final currentCalcId = DateTime.now().millisecondsSinceEpoch;
-              _lastRouteCalcId = currentCalcId;
-
-              // Arrêter toute animation en cours pour éviter les conflits
-              _routeAnimationController?.stop();
-
+              // S'il y a dÃ©jÃ  un trajet d'affichÃ©, on lance l'animation d'effacement
               if (_displayedRoutePoints.isNotEmpty) {
                 setState(() {
                   _oldRoutePoints = List.from(_displayedRoutePoints);
@@ -378,9 +372,9 @@ class _DeliveryScreenState extends State<DeliveryScreen>
                   _isErasing = true;
                 });
 
-                // On efface, puis on dessine seulement si c'est toujours le même calcul
+                // On efface, puis on dessine
                 _routeAnimationController?.reverse(from: 1.0).then((_) {
-                  if (mounted && _lastRouteCalcId == currentCalcId) {
+                  if (mounted) {
                     setState(() {
                       _isErasing = false;
                     });
@@ -388,6 +382,7 @@ class _DeliveryScreenState extends State<DeliveryScreen>
                   }
                 });
               } else {
+                // S'il n'y a pas d'ancien trajet, on dessine directement le nouveau
                 setState(() {
                   _routePoints = points;
                   _isErasing = false;
