@@ -272,7 +272,7 @@ class _DeliveryScreenState extends State<DeliveryScreen>
           pickupAddress != 'Recherche en cours...') {
         try {
           final geocodeUrl = Uri.parse(
-              'https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(pickupAddress)}.json?access_token=$_mapboxToken&country=CI&limit=1');
+              'https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(pickupAddress)}.json?access_token=$_mapboxToken&country=CI&proximity=${_currentLocation.longitude},${_currentLocation.latitude}&limit=1');
           final geoResponse = await http.get(geocodeUrl);
           if (geoResponse.statusCode == 200) {
             final geoData = json.decode(geoResponse.body);
@@ -295,7 +295,7 @@ class _DeliveryScreenState extends State<DeliveryScreen>
       if (validDestinations.isEmpty && dest == null) {
         try {
           final geocodeUrl = Uri.parse(
-              'https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(dropoffAddress)}.json?access_token=$_mapboxToken&country=CI&limit=1');
+              'https://api.mapbox.com/geocoding/v5/mapbox.places/${Uri.encodeComponent(dropoffAddress)}.json?access_token=$_mapboxToken&country=CI&proximity=${_currentLocation.longitude},${_currentLocation.latitude}&limit=1');
           final geoResponse = await http.get(geocodeUrl);
           if (geoResponse.statusCode == 200) {
             final geoData = json.decode(geoResponse.body);
@@ -488,6 +488,9 @@ class _DeliveryScreenState extends State<DeliveryScreen>
           }
           setState(() {
             pickupAddress = addressName;
+            // IMPORTANT: Toujours lier l'adresse textuelle à la coordonnée GPS exacte
+            // pour éviter que _calculateRoute ne refasse une recherche texte imprécise
+            _customPickupLocation = LatLng(lat, lon);
           });
 
           if (addressName != 'Position actuelle' &&
